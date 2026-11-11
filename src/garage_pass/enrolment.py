@@ -1,0 +1,389 @@
+"""Enrolment: the one-time credential, where a garage enrols, and what is
+derived. The pure half -- nothing here touches a database.
+
+**THE EMAIL IS THE IDENTITY, THE QR IS THE CREDENTIAL, AND THERE IS NO
+ACCOUNT AND NO PASSWORD.** An enrolment is a token minted once, returned once
+by the call that issued it, and known to this module afterwards only by its
+SHA-256. A lane presents the token with the vehicle identity it measured; the
+store binds that identity to the pass, marks the credential redeemed, and
+answers the movement by the module's own access call. A holder link is the
+same primitive scoped to one pass: redeemed once, it lets the holder write
+their own name and phone and ask for an enrolment.
+
+**NO QR IMAGE.** This module returns the token and the payload string the QR
+carries (``payload_of``). Rendering a bitmap is the client's job and a
+dependency this package will not take. ``secrets`` and ``hashlib`` from the
+standard library, nothing else.
+
+**WHERE A GARAGE ENROLS FOLLOWS FROM WHETHER IT SELLS TRANSIENT (R1).** A
+garage with no transient parking does not admit an unregistered vehicle, so the
+registration must happen at its entry: ``where_enrolment_happens`` DERIVES
+``'entry'`` for it, from a stated field, the way a pass's ``expired`` is
+derived -- not a guessed default. A transient garage has a choice and states
+``enrols_at``; unstated, the redemption refuses to answer naming the field.
+The order when both are unstated is deterministic and stated here:
+``garage.transient_available`` first (it is the field that decides), and
+``garage.enrols_at`` only when transient is stated true.
+
+**``expired`` IS DERIVED** from ``starts_on`` + ``days_valid`` against the
+garage's local day, exactly as ``states.effective_state`` derives a pass's --
+nobody may type it, and ``parse_credential_state`` refuses it by its own code.
+A credential issued for ``starts_on`` with ``days_valid`` N may be redeemed on
+N local days: ``starts_on`` through ``last_day`` = ``starts_on`` + N - 1. The
+product's number is three (one-time use, valid 3 days from the starting
+day); it is documented, never defaulted: ``days_valid`` is STATED, and
+``require_days_valid`` refuses an absent one by name.
+
+**ONE QR PER CAR, AND IT KEEPS WORKING FOR THAT CAR.** A redeemed enrolment
+is BOUND to exactly one vehicle identity, the one the lane measured at its
+first use. Shown again by that car it answers for that car, in and out, for as
+long as the pass covers it. **SIMILAR ENOUGH GETS A PASS** (since
+2026-10-30, ``similar_enough``): the lane's read is that car when it is the
+plate once look-alike characters are one (``LOOK_ALIKE_GROUPS``), when it
+differs by one character after that, or when nothing usable was read. A
+clearly different read -- two differences or more -- opens nothing on its
+own: a picture match or a person decides (``confirm_match``); on a QR stored
+before plates were required it is refused by name (wrong car), never
+"already used". Several outstanding enrolments on one pass
+are allowed and intended -- a pass may carry several vehicles -- and each binds
+one car. Nobody should build a one-outstanding-per-pass rule: the owner's pooling
+rule forbids it. A bound QR whose car was replaced on the pass is EXIT ONLY: it
+answers at an exit and is refused at an entry (migration 0005). A holder link
+is still used once.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import secrets
+import unicodedata
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from enum import Enum
+
+from garage_pass.findings import (
+    REFUSAL_DAYS_VALID_NOT_POSITIVE,
+    REFUSAL_DAYS_VALID_NOT_STATED,
+    REFUSAL_ENROLMENT_EXPIRED_IS_DERIVED,
+    REFUSAL_STATE_UNKNOWN,
+    REFUSAL_WHERE_TO_ENROL_UNSTATED,
+    Refused,
+)
+from garage_pass.garage import ENROLS_AT_ENTRY, Garage, require_text
+from garage_pass.localday import require_aware
+from garage_pass.typed import require_typed
+
+#: What the QR carries: a prefix naming the module and the credential's format
+#: version, then the token. A lane may present the whole payload or the bare
+#: token; ``token_of`` reads either.
+PAYLOAD_PREFIX = "openparking-garage-pass/1/"
+
+
+class CredentialState(Enum):
+    """The states somebody TYPES -- for an enrolment and for a holder link
+    alike. ``expired`` is not here: it is derived by ``credential_state``."""
+
+    ISSUED = "issued"
+    REDEEMED = "redeemed"
+    CANCELLED = "cancelled"
+
+
+#: The derived state's name, for answers and the contract. Not a CredentialState.
+EXPIRED_CREDENTIAL = "expired"
+
+#: The one reason this module cancels a credential: the pass it opens was
+#: revoked, and a credential must not outlive the pass (R5).
+CANCELLED_BY_REVOCATION = "pass revoked"
+
+
+@dataclass(frozen=True)
+class MintedToken:
+    """The plaintext, and the only thing about it that is ever stored."""
+
+    token: str
+    sha256: str
+
+    @property
+    def payload(self) -> str:
+        return payload_of(self.token)
+
+
+def mint() -> MintedToken:
+    """A fresh credential: 32 bytes from the operating system's CSPRNG, URL-safe,
+    and its SHA-256 hex digest."""
+    token = secrets.token_urlsafe(32)
+    return MintedToken(token=token, sha256=digest(token))
+
+
+def digest(token: str) -> str:
+    """The SHA-256 hex digest of a token -- the only form the store compares."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+#: What is not part of a plate when two plates are compared, wherever it is:
+#: the dot; EVERY DASH -- every character Unicode files as dash punctuation
+#: (category Pd: the hyphen-minus, en dash, em dash and the rest) and the minus
+#: sign; besides every character ``str.isspace()`` calls a space (the ASCII
+#: ones, non-breaking, thin, ideographic and the rest), the invisible ones a
+#: pasted plate carries: zero-width space, zero-width non-joiner and joiner, and
+#: the byte-order mark. "abc-123", "ABC 123", "ABC.123", "ABC\u00a0123" and
+#: "ABC\u2013123" are one plate.
+_PLATE_SEPARATORS = frozenset(".\u2212\u200b\u200c\u200d\ufeff")
+
+
+def _not_part_of_a_plate(ch: str) -> bool:
+    return ch.isspace() or ch in _PLATE_SEPARATORS or unicodedata.category(ch) == "Pd"
+
+
+#: The letter O is read as the digit 0 and the letter I as the digit 1. A plate
+#: reader's alphabet has no I and no O, so it prints the digit for either
+#: letter: a plate typed GO4IT is read G041T, and the two must be one plate.
+_READ_AS_DIGITS = str.maketrans("OI", "01")
+
+
+def plate_key(text: str) -> str:
+    """THE ONE NORMAL FORM a plate is compared in -- EVERY comparison of a
+    plate in this module: what the desk types, what a lane reads, what a
+    registration holds and what a visit records. Capitals, with no space (any
+    Unicode space), no invisible character, no dash of any kind and no dot
+    anywhere, and O read as 0 and I as 1 (``_READ_AS_DIGITS``). The plate as
+    typed is kept beside it for display; this is what is matched. Blank once
+    normalised is the empty string, which the callers name -- never a database
+    error."""
+    return _unseparated(text).translate(_READ_AS_DIGITS)
+
+
+def _unseparated(text: str) -> str:
+    return "".join(ch for ch in text.upper() if not _not_part_of_a_plate(ch))
+
+
+#: THE LOOK-ALIKES, ONE TABLE: the characters a plate reader confuses, each
+#: group read as its first character when a lane's read is compared with the
+#: plate a QR was made for. The first two groups EXTEND ``_READ_AS_DIGITS`` (O
+#: as 0, I as 1, which ``plate_key`` already does); Q and D join O, L joins I,
+#: and B/8, S/5, Z/2 and G/6 are new. ``plate_key`` -- the form every plate is
+#: STORED and registered in -- keeps only O and I: widening it would make
+#: ABC5 and ABCS one car for one-car-one-pass and for every register a lane
+#: holds. Read only by ``look_alike_key``, for the QR at the lane.
+LOOK_ALIKE_GROUPS = ("0OQD", "1IL", "8B", "5S", "2Z", "6G")
+_LOOK_ALIKE = str.maketrans({ch: group[0] for group in LOOK_ALIKE_GROUPS for ch in group[1:]})
+
+#: The shortest plate -- the QR's, folded -- that one difference may pass for
+#: (since 2026-10-30). On a shorter plate one character is too
+#: large a share of it: such a plate passes on the same plate, a look-alike or
+#: nothing read, and one difference is a clearly different car.
+ONE_DIFFERENCE_MIN_LENGTH = 5
+
+
+def look_alike_key(text: str) -> str:
+    """A plate in ``plate_key`` form with every look-alike read as one
+    character (``LOOK_ALIKE_GROUPS``): 'A8C-123', 'ABC 123' and 'A8CI23' are
+    one key. For comparing a lane's read with a QR's plate, never for
+    storing."""
+    return plate_key(text).translate(_LOOK_ALIKE)
+
+
+def within_one_difference(a: str, b: str) -> bool:
+    """Whether ``b`` is ``a`` with at most one character substituted, inserted
+    or deleted (an edit distance of one or none)."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b, strict=True)) <= 1
+    shorter, longer = (a, b) if len(a) < len(b) else (b, a)
+    for i in range(len(shorter)):
+        if shorter[i] != longer[i]:
+            return shorter[i:] == longer[i + 1:]
+    return True
+
+
+#: How a lane's read passes for the plate a QR was made for -- the rule
+#: since 2026-10-30, "similar enough gets a pass" (``similar_enough``).
+PASSED_SAME_PLATE = "same_plate"
+PASSED_LOOK_ALIKE = "look_alike"
+PASSED_ONE_DIFFERENCE = "one_difference"
+PASSED_NOTHING_READ = "nothing_read"
+#: The passes that are RECORDED on the QR's own row: the read was not the
+#: plate, and the QR opened anyway.
+RECORDED_PASSES = frozenset({PASSED_ONE_DIFFERENCE, PASSED_NOTHING_READ})
+
+
+def similar_enough(read: str | None, plate: str) -> str | None:
+    """THE ONE DECISION on whether the car at the lane is the QR's car, from
+    what the lane read and the plate the QR was made for. Which rule passed,
+    or None for a CLEARLY DIFFERENT plate:
+
+      * nothing usable read -- no plate, or one below the lane's confidence,
+        which the lane hands in as nothing -- ``nothing_read``;
+      * the same plate in ``plate_key`` form: ``same_plate``;
+      * the same once every look-alike is one character: ``look_alike``;
+      * one character substituted, inserted or deleted after that:
+        ``one_difference`` -- on a QR plate of ``ONE_DIFFERENCE_MIN_LENGTH``
+        characters or more, folded; a shorter plate is clearly different;
+      * two differences or more: None -- the gate stays shut on this QR and
+        the car is a case for a person (``match_required``).
+
+    The owner's own deny rule for a plate is the lane's, and the lane checks
+    it before it opens on any of these."""
+    if read is None or not plate_key(read):
+        return PASSED_NOTHING_READ
+    if plate_key(read) == plate_key(plate):
+        return PASSED_SAME_PLATE
+    seen, made_for = look_alike_key(read), look_alike_key(plate)
+    if seen == made_for:
+        return PASSED_LOOK_ALIKE
+    if len(made_for) >= ONE_DIFFERENCE_MIN_LENGTH and within_one_difference(seen, made_for):
+        return PASSED_ONE_DIFFERENCE
+    return None
+
+
+def register_hash(token_sha256: str) -> str:
+    """What a garage's register publishes for a QR: the SHA-256 of its stored
+    digest (the hex text), so a lane that caches the register can decide on a
+    QR with no database -- it hashes the token it read twice and looks the
+    result up. ONE-WAY TWICE: the register yields no working QR, and it is
+    never the digest the row holds, so a copy of the register matches no
+    stored value either (G23: the digest is never rendered)."""
+    return hashlib.sha256(token_sha256.encode("ascii")).hexdigest()
+
+
+def register_hash_of(presented: str) -> str:
+    """The lane's half: the register hash of what a QR carried (the payload or
+    the bare token)."""
+    return register_hash(digest(token_of(presented)))
+
+
+def payload_of(token: str) -> str:
+    return PAYLOAD_PREFIX + token
+
+
+def token_of(presented: str) -> str:
+    """The bare token from what a lane presented: the payload the QR carried,
+    or the token on its own. Whitespace around it is not part of it."""
+    text = require_text(presented, "token")
+    if text.startswith(PAYLOAD_PREFIX):
+        return text[len(PAYLOAD_PREFIX):]
+    return text
+
+
+def parse_credential_state(name: object) -> CredentialState:
+    """A typed state by name. ``expired`` is refused by its own code, because
+    somebody typing it is the mistake the derivation exists to prevent."""
+    if name == EXPIRED_CREDENTIAL:
+        raise Refused(REFUSAL_ENROLMENT_EXPIRED_IS_DERIVED, "state", "'expired' was typed.")
+    try:
+        return CredentialState(name)
+    except ValueError:
+        raise Refused(
+            REFUSAL_STATE_UNKNOWN, "state",
+            f"{name!r}; the typed credential states are {[s.value for s in CredentialState]}.",
+        ) from None
+
+
+def require_days_valid(value: object) -> int:
+    """A stated, positive whole number of days -- or a refusal by name. ``None``
+    is refused as NOT STATED, never read as a default: how long a QR may wait
+    is the owner's to state."""
+    if value is None:
+        raise Refused(REFUSAL_DAYS_VALID_NOT_STATED, "days_valid", "days_valid is not stated.")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise Refused(
+            REFUSAL_DAYS_VALID_NOT_POSITIVE, "days_valid",
+            f"days_valid must be a positive whole number of days, not {value!r}.",
+        )
+    if value <= 0:
+        raise Refused(
+            REFUSAL_DAYS_VALID_NOT_POSITIVE, "days_valid", f"days_valid is {value}."
+        )
+    return value
+
+
+def last_day(starts_on: date, days_valid: int) -> date:
+    """The last local day a credential may be redeemed on: ``starts_on`` plus
+    ``days_valid`` less one, inclusive. Three days from June 1st is June 1st,
+    2nd and 3rd."""
+    return starts_on + timedelta(days=days_valid - 1)
+
+
+def credential_state(
+    starts_on: date, days_valid: int, state: CredentialState, today: date
+) -> str:
+    """The state a redemption reads: the typed one, or ``expired``. The
+    terminal states outrank expiry -- a redeemed credential is redeemed and a
+    cancelled one is cancelled, whatever the day."""
+    if state is not CredentialState.ISSUED:
+        return state.value
+    if today > last_day(starts_on, days_valid):
+        return EXPIRED_CREDENTIAL
+    return state.value
+
+
+def where_enrolment_happens(garage: Garage) -> str:
+    """``'entry'`` or ``'exit'``, or a refusal naming the field that would
+    decide -- ``garage.transient_available`` first, ``garage.enrols_at`` only
+    when transient is stated true. Derivation, not a default: a garage with no
+    transient enrols at entry because R1 leaves it nowhere else."""
+    if garage.transient_available is None:
+        raise Refused(
+            REFUSAL_WHERE_TO_ENROL_UNSTATED, "garage.transient_available",
+            f"garage {garage.id!r} has not stated whether transient parking is available, "
+            "which decides where it enrols.",
+        )
+    if garage.transient_available is False:
+        return ENROLS_AT_ENTRY
+    if garage.enrols_at is None:
+        raise Refused(
+            REFUSAL_WHERE_TO_ENROL_UNSTATED, "garage.enrols_at",
+            f"garage {garage.id!r} sells transient parking and has not stated whether it "
+            "enrols at entry or at exit.",
+        )
+    return garage.enrols_at
+
+
+@dataclass(frozen=True)
+class Credential:
+    """An enrolment or a holder link as the store reads it: never the token,
+    only what was recorded about it. ``vehicle_description`` is the holder's
+    own statement of the car they will bring and DECIDES NOTHING (enrolments
+    only; a link carries none)."""
+
+    kind: str
+    id: str
+    pass_id: str
+    starts_on: date
+    days_valid: int
+    state: CredentialState
+    issued_by: str
+    issued_at: datetime
+    vehicle_description: str | None = None
+    redeemed_at: datetime | None = None
+    cancelled_at: datetime | None = None
+    cancelled_reason: str | None = None
+    #: The car this enrolment is bound to, once it was used; None before, and
+    #: always None for a holder link. Kept when the enrolment is cancelled.
+    bound_identity: str | None = None
+    #: When the bound car was replaced on the pass: from then the QR opens no
+    #: entry and still answers at an exit. Enrolments only.
+    exit_only_at: datetime | None = None
+    #: The plate the QR was ISSUED for, in ``plate_key`` form: the QR is bound
+    #: to it from issue (migration 0005). None on a QR stored before plates were
+    #: required, which binds on first use as it always did.
+    plate: str | None = None
+
+    @property
+    def bound(self) -> str | None:
+        """The car this QR answers for: its plate from issue, or -- on a QR
+        stored without one -- the identity it bound at first use."""
+        return self.plate if self.plate is not None else self.bound_identity
+
+    def __post_init__(self) -> None:
+        require_typed(self)
+        require_aware(self.issued_at, "issued_at")
+        require_days_valid(self.days_valid)
+
+    @property
+    def last_day(self) -> date:
+        return last_day(self.starts_on, self.days_valid)
+
+    def state_on(self, today: date) -> str:
+        return credential_state(self.starts_on, self.days_valid, self.state, today)

@@ -1,0 +1,507 @@
+# Open Parking AI — garage pass
+
+**This vehicle, at this lane, going this direction, at this instant — does a
+pass cover it, and if not, why not?** That question, and nothing else.
+
+Standalone. It runs with no parking system around it, no platform, and — for
+the answer itself — no database and no dependencies at all.
+
+```
+$ garage-pass check-terms --pass pass.json
+$ garage-pass access --garage garage.json --pass pass.json \
+      --registrations registrations.json --visits visits.json [--garages others.json] \
+      --vehicle CAR-1 --lane L1 --direction entry --at 2026-06-01T12:00:00-06:00
+```
+
+And, against the store: create the pass, register the vehicle, record what the
+lane saw, answer the lane from what is actually recorded, read the pass whole.
+Exit status 0 covered,
+1 not covered, 2 refused to answer or the machine's configuration (one sentence
+on stderr: no DSN, a database that does not connect or is not migrated, a role
+without its grants, no timezone database), 3 the request was refused — and a
+refusal is always the JSON `{"refused", "field", "detail"}`, never a traceback:
+a mistyped timezone, a document that is not JSON, an instant without an offset,
+a day that does not parse, and — at an entry — a field of the wrong type are each
+refused naming the field and the value; at an exit a document the module cannot
+read is answered not-covered naming the field, because an exit is never refused. **Every value a document carries is checked against
+the type the dataclass it loads into declares** — derived from the annotation,
+not from a list, so a field added later is covered the day it is added — and a
+string is never reinterpreted as a list of its characters. What the database
+driver raises that the store did not turn into a named refusal is the sentence
+on stderr with its SQLSTATE, exit 2, mapped last: the refusals the store names
+(a unique violation, the one-car-one-pass exclusion, a deadlock with its DETAIL)
+keep their names.
+
+```
+$ garage-pass create-pass --tenant T --garage garage-downtown --pass pass.json --by owner --at ...
+$ garage-pass register-vehicle --tenant T --garage garage-downtown --pass-id pass-1 \
+      --vehicle CAR-1 --effective-day 2026-06-01
+$ garage-pass record-entry --tenant T --garage garage-downtown --pass-id pass-1 \
+      --vehicle CAR-1 --lane L1 --at 2026-06-01T09:00:00-06:00
+$ garage-pass access-in-store --tenant T --garage garage-downtown \
+      --vehicle CAR-1 --lane L1 --direction exit --at 2026-06-01T12:00:00-06:00 \
+      [--entered-at 2026-06-01T09:00:00-06:00]
+$ garage-pass show-pass --tenant T --garage garage-downtown --pass-id pass-1
+$ garage-pass show-garage-register --tenant T --garage garage-downtown
+```
+
+## What a pass is
+
+The garages it answers at — one or more, a set the owner states by listing
+them, never an "everywhere" flag; a pass answers at every garage it names and at
+no other. An owner-typed **label** — "Employee", "Monthly", "Vendor", whatever
+the owner needs — that no behaviour reads. A **holder**: an email address, and
+optionally a name and a phone; no account, no login. Its **terms**. Its
+**state**. The **vehicles** registered to it.
+
+**There are not five pass types.** The only structural difference between
+passes is which other module is connected to them, and in this version none is.
+
+### Terms — six things, each stated or absent, no defaults
+
+A valid-from / valid-to range in the garage's local day. Recurring windows: days
+of the week plus minutes of the local day. A maximum stay per visit. A visit
+allowance, over the pass's life or per window. The directions the pass states —
+entry, exit or both; nothing is implicit. The lanes it may use, stated per
+garage — lane `A1` at two garages is two barriers — absent means every lane at
+every garage the pass names. The terms are one set, on the pass, evaluated at
+whichever garage the car is at: a 20-visit allowance is 20 on the pass, not 20
+per garage; only the lanes are per garage.
+
+**A contradiction is refused when the pass is created, naming the field.** A
+valid-to before valid-from, a weekend window on a Monday-to-Wednesday pass, a
+maximum stay of zero, an allowance of zero — none of them can be constructed, so
+none is ever discovered at a gate at seven in the morning. And only a
+contradiction is refused: a maximum stay longer than a window is slack, not a
+contradiction — windows bind the moments a car enters and leaves, never the stay
+between them — so a six-hour maximum beside two four-hour windows is created,
+and binds at the exit.
+
+### States
+
+`draft`, `awaiting_enrolment`, `active`, `suspended`, `revoked` — and `expired`,
+which is derived from the terms and which nobody can type. **Revoked is
+terminal.** Every change records who, when and why, into a history the
+application can only append to — it holds no UPDATE or DELETE on the history
+and no DELETE on any table at all, so it cannot be erased by deleting the pass
+or anything else.
+
+### Enrolment — the QR, the lane bind, the holder's own details
+
+**The email is the identity, the QR is the credential, and there is no account
+and no password.** An owner mints a QR for a pass (`issue-enrolment`): a token
+returned exactly once, by that call, and known to the module afterwards only
+by its SHA-256 — no read, no listing and no refusal carries the plaintext, and
+no column stores it. `--days-valid` is stated, never defaulted; the
+monthly-parker product uses three days from the starting day, and that is its
+number, not this module's. The lane presents the QR with the vehicle identity it
+measured (`redeem-enrolment`), and in one transaction the car is registered
+effective that local day, the pass moves to active if it was not already
+(recorded, with the enrolment as the actor), the QR is bound to that car, and
+the lane gets **the access answer for that same movement, from the module's own
+access path**. **One credential, one spend, under
+concurrency**: two lanes presenting the same QR at the same instant get exactly
+one bind — the pass row is locked first, then the credential row, everything is
+re-checked under those locks, and the spend itself carries `state = 'issued'`
+and asserts one row, so the loser is refused by name and never told yes. The
+module is written for READ COMMITTED, the store's default; a caller driving it
+at a stricter level meets the database's serialization failure as the same
+named refusal a deadlock gets. A refused redemption — a QR bound to another
+car, a cancelled, expired or not-yet-started QR, the wrong end, a pass that is not registrable, a
+lane the pass's terms do not name, **a direction the pass's terms do not
+allow** (only a structural exclusion refuses the bind; a weekday pass presented
+on a Sunday, a `valid_from` still ahead or a movement outside the hours still
+binds — enrolling at the weekend is the ordinary case), an identity already on
+another pass — writes nothing and **still answers the movement**; at an exit
+lane the answer is never a refusal. A revocation racing a redemption, in either
+order, leaves no live registration and no live QR on the revoked pass.
+**Where a garage enrols follows from whether it sells transient
+parking**: a garage with no transient enrols at entry, derived; a transient
+garage states `entry` or `exit` (`set-garage-enrols-at`, recorded like the
+timezone repair), and unstated refuses to answer naming the field. A pass may
+carry several outstanding QRs — several cars — and each binds one car.
+Revoking the pass cancels every QR on it, bound or not.
+
+**A QR is made for one car, by its licence plate.** `issue-enrolment`,
+`replace-car` (the new car's) and the holder's own link all require `--plate`;
+without it — or blank once spaces, invisible characters, dashes and dots are
+taken out — nothing is made. The plate is kept as typed for display, and
+compared in one normal form: capitals, with no space of any kind (a
+non-breaking or other Unicode space included), no invisible character
+(zero-width space, joiner and non-joiner, byte-order mark), no dash of any kind
+(hyphen, en dash, em dash, minus sign and the rest) and no dot, and with the
+letter O read as the digit 0 and I as 1 (a plate reader prints the digit for
+either), so `abc-123` typed and `ABC 123` read are the same car, and so are
+`GO4IT` typed and `G041T` read. **Every** plate comparison uses it:
+what the desk types, what a lane reads with or without a QR, what a
+registration holds and what a visit records — a car asked about by its plate
+alone, read as `xyz 789`, is the `XYZ789` registered. Registrations and visits
+are stored in that form (migrations 0006 and 0007 make the database refuse any other). The QR is **bound to
+that plate from the moment it is made**: the plate is registered on the pass in
+the same transaction (a plate another pass holds is refused there, at the desk;
+a plate THIS pass already holds — a QR reissued for the same car, a replaced
+car coming back — keeps the registration it has, never registered twice and
+never refused as another pass, and that registration runs on to the new QR's
+last day where it ended sooner), the garage's register shows it before
+any use, and the QR's first use binds nothing new — it is recognised, and moves
+a pass still waiting for its first car to active. A car whose plate is asked
+about without a QR is asked about in that normal form. At the lane **similar
+enough gets a pass** (since 2026-10-30): a valid QR is recognised
+for its car when the lane read the plate itself, the plate once look-alike
+characters are one (O, 0, Q and D; I, 1 and L; B and 8; S and 5; Z and 2; G
+and 6 — one table, `LOOK_ALIKE_GROUPS`, used for the QR and never for
+a plate kept in the store), a plate one character from it after that (one substituted, inserted
+or deleted) where the QR's plate, folded, has five characters or more
+(`ONE_DIFFERENCE_MIN_LENGTH`; a shorter plate passes on the plate, a look-alike
+or nothing read, and one difference is clearly different), or nothing usable —
+the lane hands in nothing when it read no plate or one below its confidence.
+The answer says which (`passed_by`), beside the QR's own id (`enrolment`) so the
+stay can be tied to the QR, and it carries the QR's plate (`qr_plate`) so the lane checks its owner's deny rule
+against the car it lets in. A pass by one difference or by nothing read is
+kept on the QR's record with its time, lane, direction and what was read. A
+**clearly different** read — two characters or more — opens nothing on the QR:
+**the plate supports the picture match and never refuses on its own**, so it
+is a picture match against the registered plate, carrying what was read, a
+case for a person, and only the match's own "no" (`confirm-match`) is wrong
+car. The answer beside it is the answer for what was read, so another plate
+with its own valid pass is let through on that pass, never on this QR. A QR
+stored before plates were required has no plate and binds whatever car first
+uses it, exactly as before, and keeps its exact binding.
+
+**One QR per car, and it keeps working for that car.** Once bound, the QR is
+the car's: shown again by that car it is *recognised* — answered for that car,
+at either end, in and out as often as needed, for its stay — and nothing is
+written. **A car the QR cannot vouch for is never let in on it blind** — a
+clearly different plate on a QR made for a plate, or nothing read on a QR stored
+without one: the bound QR answers `match_required`, with the QR's id and the car it
+is bound to, and nothing opens on that QR; the lane matches the car's picture against that
+car's earlier ones (its OPA ID, or an outside picture check when that is
+unclear) and answers with `confirm-match` — matched is a recognised use, not
+matched is wrong car — and every answer is kept on the QR's record with its
+time, so a car that keeps needing a match is visible. A QR stored without a
+plate, shown by a **different** car, is refused
+`REFUSAL_CREDENTIAL_WRONG_CAR` — never "already used", with no exception — and
+the driver is sent to whoever issued it; the refusal names the QR and when it
+was bound, never the other car. A car whose identity the lane cannot read at
+the QR's first use is not bound (`vehicle_identity` is refused blank).
+
+**A stay ends at checkout; the same car with its next guest is a new stay.** A
+QR made for a plate registers that plate from `--starts-on` to the QR's last day
+(`--starts-on` plus `--days-valid` less one — the checkout day), never open and
+never past the pass's `valid_to`. Rental cars come back with a new guest: the
+car's next stay, on another pass, may start on that last day — the earlier
+registration ends that day, by name (`the car's next stay began`), and the next
+one starts. Before that day the plate on another pass is still refused by name,
+naming the earlier pass and its last day. A registration the owner ended, or a
+revocation ended, is not a stay's last day: the car is free from its end day,
+as before. **A stay ended early** (`end-stay`: the guest checked out — the day,
+who and why) ends every car of the pass on that day, at every garage. On the
+day a stay ended early or turned over, its QR is refused
+`REFUSAL_CREDENTIAL_EXIT_ONLY` at an entry and lets the car out at an exit, on
+its own pass — and on the day a stay ended early, the car read by its plate at
+an exit is let out on that pass the same way; after that day the QR is refused
+`REFUSAL_CREDENTIAL_STAY_ENDED` at either end, and before its stay begins
+`REFUSAL_CREDENTIAL_NOT_STARTED`.
+**Nothing carries over**: a plate read, a QR and a picture match for the next
+stay answer on the next stay's pass, never the earlier one. A shorter stay is
+`end-registration` (to an earlier day) or `end-stay`.
+
+**Replacing a car is one step** (`replace-car`, from the QR of the car being
+replaced): that QR becomes **exit only** — refused `REFUSAL_CREDENTIAL_EXIT_ONLY`
+at an entry, recognised and covered at an exit, so a car that broke down inside
+can leave without paying — and a new QR is issued on the same pass for the
+replacement car, its token returned once by that call. The old car read by its
+identity alone is answered the same way (not covered for an entry, reason
+`EXIT_ONLY`; covered at the exit). The exit covered is the stay that was inside
+at the replacement: `--entered-at` states when the stay that is leaving entered,
+and a stay that entered after the replacement is not covered (`EXIT_ONLY`);
+with no entry instant the exit is covered and the replacement is named in
+`unmeasured`. A QR of the car whose own last day has passed, or whose first day
+has not come, no longer keeps the replaced car entering. A QR that never bound
+has no car inside and is cancelled instead. All of it or none of it.
+**Cancelling one QR**
+(`cancel-code`) cancels that QR alone, bound or not — the pass, its other QRs
+and its registrations stay as they were (a car the QR had bound stays on the
+pass; ending the car is `end-registration`) — and a fresh QR is issued with
+`issue-enrolment`, for the same plate, on the registration the car already has.
+
+The holder's own details: a one-time link (`issue-holder-link`), the same
+primitive scoped to the pass, lets the holder write their name and phone onto
+the pass — those two columns and nothing else — describe the car they will
+bring (which decides nothing), and get their QR (`redeem-holder-link`). The
+owner-only path stands: no link is needed to enrol. Text anywhere — a name, a
+phone, an id, a lane, a label — may be in any script; a control character in
+it (a NUL, a line break inside it) is refused by name, never handed to the
+database driver.
+
+```
+$ garage-pass set-garage-enrols-at --tenant T --garage garage-downtown --enrols-at entry \
+      --by owner --at 2026-06-01T09:00:00-06:00 --reason "readers are at the entry lanes"
+$ garage-pass issue-enrolment --tenant T --garage garage-downtown --pass-id pass-1 \
+      --enrolment-id qr-1 --plate "ABC-123" --starts-on 2026-06-01 --days-valid 3 \
+      --by owner --at ...
+$ garage-pass redeem-enrolment --tenant T --garage garage-downtown --token <what the QR carried> \
+      --vehicle CAR-1 --lane L1 --direction entry --at 2026-06-01T09:00:00-06:00
+$ garage-pass replace-car --tenant T --garage garage-downtown --enrolment-id qr-1 \
+      --new-enrolment-id qr-2 --plate "XYZ 789" --starts-on 2026-06-02 --days-valid 3 --by desk \
+      --reason "rental car swapped" --at ...
+$ garage-pass confirm-match --tenant T --garage garage-downtown --enrolment-id qr-1 \
+      --matched yes --decided-by opa_id --lane L1 --direction entry --at ...
+$ garage-pass cancel-code --tenant T --garage garage-downtown --enrolment-id qr-2 \
+      --by desk --reason "never received" --at ...
+```
+
+### One car, one pass per garage
+
+A vehicle identity is on one pass at a garage for any given day. A second
+registration is refused by name — naming the garage, the pass that holds the
+identity, its state and the day that registration ends — before the database's
+own constraint has to; every open registration counts as a holder whatever its
+pass's state, so the constraint is the backstop for a raw insert and for two
+writers genuinely racing, and nothing else reaches it through the module. A
+registration is written at **every garage the pass names**, one row per garage
+in one transaction — a pass over three garages holds the car at all three from
+one enrolment; a car held by another pass at any one of them refuses the whole
+registration, and a partial fan-out is never an outcome. Ending a registration
+on day D frees the identity **from** D, at every garage of the pass.
+
+**A vehicle is registered onto a draft, awaiting-enrolment or active pass.** A
+registration onto a suspended pass (a hold; a car added to a hold is a claim the
+owner did not make), a revoked pass (revoked is revoked) or an expired one (over,
+derived from `valid_to` against the registration's effective day) is refused by
+name, naming the state.
+
+### Reading a pass whole
+
+`show-pass` is the one read of a pass, for any reader: the pass id, its stored
+state, the two days its terms bound it with (`valid_from` and `valid_to`, ISO
+days or `null`), the garages it names (external ids, sorted) and **every**
+registration it holds, history included — ended rows too — each as the identity
+as recorded, the garage's external id, `effective_day`, `end_day` and
+`ended_reason`. Nothing else: not the holder's name, phone or email, no term
+beyond the two valid days (not the windows, the maximum stay, the allowance, the
+lanes or the directions), not the label, nothing from the credential tables — the
+reader needs the register and needs to know *when* the pass covers, not *how*,
+and personal data it does not need does not travel. It writes nothing (proven by
+row counts and row digests of every table before and after). **It uses no
+clock**: the state shown is the stored one and `expired` is not derived — a pass
+spans garages in different timezones, so which day is the reader's call; the
+reader compares the two days with its own. A `null` bound is a bound the terms
+did not state (both are optional) or terms the module cannot read, and the
+second is already named in `unreadable`. The order is the module's, applied in
+Python by code point — identity, then effective day, then garage — never the
+database's collation, so a reader on another machine gets the same bytes. A pass
+the module cannot read (G17) is still shown, with the field named; a garage of
+the set whose timezone the running system does not carry stops no read, and is
+named. The same `--garage` every store command takes: a garage the pass does not
+name is refused naming the set (G25 — the read is not a way to look a pass up
+from a garage it does not answer at).
+
+### Reading a garage's register
+
+`show-garage-register` is the one read of a garage's register, for any reader,
+and it answers the question `show-pass` cannot: a reader that has to hold
+every entitlement at a garage — a lane refreshing what it decides from — was
+never told a pass id. It takes the two arguments every store command takes
+(`--tenant`, `--garage`) and prints **every** registration recorded at that
+garage, history included — ended rows too — each as the identity as recorded,
+the pass's id, `effective_day`, `end_day` and `ended_reason`; **every QR** of
+every pass that names the garage, so a lane can decide on a QR with no
+database — each as its `register_hash` (the SHA-256 of its stored digest: the
+lane hashes the token it reads twice and looks it up; never the token, never the
+stored digest), its id, its pass, its stored state, the car it is bound to or
+`null`, `exit_only`, and the first and last local day an unbound QR may be used
+on; and, for every pass those rows and QRs name, the pass id, its stored state
+and its two valid days. The same rules as `show-pass`, and one more thing that
+does not travel: the pass's
+*other* garages — a reader at one garage learns which vehicles a pass holds
+there and when it covers, not where else it answers. The rows are selected by
+the garage alone, never through the pass's garage set; a row whose pass does
+not name the garage, were one to exist, is shown and its pass named in
+`passes_not_naming_garage`. It writes nothing, uses no clock, derives no
+`expired` and drops no ended row — the reader compares the four days with its
+own. The garage itself stored with a timezone the system does not carry stops
+no read and is named in `unreadable_garage`; a garage with no registration
+answers an empty register, never a refusal; a garage the tenant does not have
+is refused by name.
+
+## The answer
+
+**Covered**, with the pass and the term that covers it. **Not covered**, with a
+plain reason: no pass · not active · not started · expired · suspended ·
+revoked · direction not allowed · wrong lane · outside window · out of visits ·
+over maximum stay · a pass or garage carrying a value the module cannot read
+· at an exit, a blank identity or lane. Or — **at an entry only** — **refused to
+answer**, naming the field that would let it: a garage that has not stated
+whether it sells transient parking, a blank identity, a pass whose stored terms
+cannot be read. It does not guess: a maximum stay with no recorded entry to
+measure from is answered on the terms that can be evaluated and named
+**unmeasured**, never silently satisfied — and so is, for a car replaced on its
+pass, whether the stay leaving entered before the replacement, when no entry
+instant is stated.
+
+**No fee, no amount, no balance ever crosses this call.** It is an access fact.
+
+**This module never opens or closes a gate**, never counts who is inside and
+holds no session state. It answers; the lane acts. What it holds is a ledger of
+the visits the lane told it about, because a visit allowance and a maximum stay
+are computed from those rows and from nothing else — and the answer says what
+it counted, on which pass, over what. **The ledger is per garage**: a pass may
+name several, and one open visit per vehicle per pass is the rule *at each* —
+an entry at one garage of the set is never refused for a visit still open at
+another, and an exit never closes another garage's visit — while the allowance
+counts every garage of the set, **each entry read on the clock of the garage
+it was recorded at**: a pass's garages can stand in different zones, and
+whether an entry fell in this window today is a question about the wall clock
+on the door it drove through, not the one at the garage asking now — so the
+pass's garages reach the engine (the store hands them in; the command line takes
+`--garages`), and an entry at a garage whose clock is not there is refused by
+name at an entry, never read on the wrong clock. A visit carries its garage, and
+**a stay is measured at the garage the car is leaving**, from the entry recorded
+there: an entry still open at another garage of the set is not this exit's
+entry, and the stay is then unmeasured and named, never measured from the wrong
+garage. Revoking a pass ends its registrations at each garage on *that*
+garage's day of the instant. Removing a garage from a pass that holds a visit
+or a registration there fails by name; nothing recorded is erased by it.
+
+### An exit is never refused
+
+A pass's terms govern entry and which lanes may be used. At exit the same terms
+are evaluated — an exit outside them is answered not-covered with its reason, so
+that a transient garage can charge the stay — but **no term, no state and no
+revocation keeps a vehicle inside a garage.** Every exit is answered covered or
+not covered — refused-to-answer is not an outcome an exit can have; whatever
+cannot be evaluated is named — every exit answer carries the sentence that says
+so, and the exit half of the call does not read the garage's transient mode at
+all. A pass stored with terms the module refuses to read — a raw write, or a
+validator tightened after the pass was stored — is answered not-covered at the
+exit, naming the pass and the field, which at a transient garage means the stay
+is chargeable: said so, so nobody reads it as a free exit, and named so the
+operator can find the row. Inconsistent data is answered too: a registration
+naming a pass that was not handed in is not-covered at the exit, naming that
+pass, never an exception; a pass handed in twice under one id is never resolved
+by the order the copies arrived in — every copy is evaluated, the holder is
+covered if any copy covers, the duplication is named, and the same inputs in any
+order give the same answer (at an entry the call refuses to answer, naming the
+id, whether or not the copies agree).
+
+**What that sentence does not cover, named because it cannot be otherwise — a
+class proven closed by execution, not a list:** a value of a type the signature
+does not accept — for any parameter of the call, or any element of its
+sequences; an instant with no timezone is one — raises on the first touch,
+before there is a movement to answer about, and never answers (the test
+enumerates the signature and hands every parameter a wrong-typed value); and a
+machine with no timezone database at all raises by its own name, never as an
+unknown zone, because nothing can be read on it. Neither is a term, a state, a
+revocation or data.
+
+**The module answers when it holds a record whose content it cannot read, and
+refuses when it holds no record at all, or no instant to read it at.** A stored
+row it cannot read loads unreadable and answers; a document it cannot read — a
+field missing, of the wrong type or unknown, a contradiction, an unknown zone —
+is answered at an exit the same way: a pass or garage document degrades to the
+unreadable pass or garage a stored row becomes, a registration or visit
+document to a not-covered answer naming the document and the field. At an entry
+the same document is refused by name. A file that is missing or is not JSON,
+and an instant that does not parse, are refused in both directions: there is no
+record, or no now. (A missing file breaks the integrator's own invocation at
+every lane in both directions — an outage of the integration, not a wrong
+answer; a malformed record breaks one parker while everything else works, and
+that is the car that must not be stuck.)
+
+### What not-covered means depends on the garage
+
+At a garage that sells transient parking, an uncovered entry is an ordinary
+paying customer. At a garage that sells none — staff only — there is nothing for
+an uncovered vehicle to be admitted as. **Which one a garage is, it states; there
+is no default and no inference.** Left unstated, the access call refuses to
+answer an entry and names the field.
+
+## A calendar day is the garage's local day
+
+A window of 06:00–20:00 is the wall clock on the garage's door, and "Monday" is
+Monday where the garage stands. The tests measure this at the window edges on the
+spring-forward and fall-back days, where a UTC reading disagrees — and a stay's
+length is elapsed time between instants, so a stay across the fall-back hour is
+an hour longer than its wall clocks say.
+
+## What is guaranteed, and how you can tell
+
+`docs/CONTRACT.md` lists every guarantee. Each one has a test that CI requires
+to run and pass, and a fail control in `scripts/fail_controls.py` that breaks
+the thing it guards and requires the test to go red. The contract's tables are
+generated from the code's own registries and checked on every run; a number or a
+sentence edited by hand fails the build.
+
+## What this version does not do
+
+No vehicle identification: a vehicle identity here is an opaque value the lane
+measures and hands in, and this module never compares it to anything but
+another identity — not to the holder's typed description of their car, which
+decides nothing. No email is sent and no QR image is drawn: the module mints the
+credential and records that it was issued; delivering it is the integrator's,
+and rendering a bitmap is the client's. No money. No connection to any billing
+module — whether the registration-day transient fee is credited, and when
+monthly status begins, is the billing connection's business — and no
+reservations of either kind. No accounts, no passwords, no screens. A pass
+answers only at the garages it names.
+
+## Install
+
+```
+pip install -e .            # the engine: standard library only
+pip install -e '.[store]'   # with the Postgres store
+pip install -e '.[dev]'     # to run the suite and the controls
+```
+
+The store needs a database with the migrations applied in order as its owner,
+and the application role given a login:
+
+```
+for m in migrations/*.sql; do psql "$DSN" -v ON_ERROR_STOP=1 -f "$m"; done   # 0001, 0002, 0003
+GARAGE_PASS_APP_PASSWORD=... python scripts/ensure-app-role.py "$DSN"
+```
+
+Both steps are run by the suite, not only described here: a test applies the
+migration and runs `ensure-app-role.py` against the test cluster, logs in as the
+application role with the password it set, and shows a wrong one refused. The
+script sends the server the SCRAM-SHA-256 verifier it computes from the
+password, never the password, so no statement and no server log of statements
+holds it.
+
+A garage stored with a timezone the running system does not carry — a raw
+write, or tzdata that lost the name — still answers (not-covered at an exit,
+refused-to-answer at an entry, naming `garage.timezone`), but takes no write
+until it is repaired; the repair is the one write it takes:
+
+```
+$ garage-pass set-garage-timezone --tenant T --garage garage-downtown --timezone America/Denver \
+      --by operator --at 2026-06-01T12:00:00-06:00 --reason "stored from a laptop as america/denver"
+```
+
+The repair is recorded — who, when, why, the old value and the new — into a
+garage history the application can only append to, exactly as a pass state
+change is; a repair with no who or no why is refused and changes nothing. The
+zone name is checked case-exactly against the tz database's own names, so
+`america/denver` is refused on every filesystem, not only a case-sensitive one.
+
+**A timezone database is required.** The engine reads every term in the
+garage's local day and cannot read one without a tz database; it does not ship
+one. On a machine with none — no system zoneinfo and no Python `tzdata`
+package — every command says so by name on stderr and exits 2, rather than
+refusing each good zone as unknown. Install the system tz database (`tzdata`
+on Debian, Ubuntu, Alpine and the RPM family) or `pip install tzdata`.
+
+The suite reads `GARAGE_PASS_TEST_DSN` for a database it may drop and rebuild.
+Without one, the store-backed tests skip and the run **fails**, on purpose: a
+guarantee whose test did not run is not a guarantee.
+
+## Licence
+
+AGPL-3.0.
+
+Open Parking AI does not accept outside contributions. Pull requests, issues and comments are limited to the maintainers.
+
+---
+
+Built by 72 Knots Method by 72Knots.ai
